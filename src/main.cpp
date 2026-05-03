@@ -278,15 +278,22 @@ void drawWiFiPage() {
 void drawExtendPage() {
   tft.fillScreen(BG);
   drawHeader();
+  
   tft.setCursor(10, 40);
   tft.setTextColor(HL);
-  tft.println("Add Credit");
+  
+  // 🔴 CHANGED: Now it dynamically shows the pending money!
+  tft.print("Added: P");
+  tft.println(pendingCredits); 
+
   tft.setCursor(10, 70);
   tft.setTextColor(OK);
   tft.println("[1] Extend Time");
+  
   tft.setCursor(10, 90);
   tft.setTextColor(TXT);
   tft.println("[2] New Port");
+  
   tft.drawRect(0, 0, 160, 128, TXT);
 }
 
@@ -485,7 +492,7 @@ void loop() {
                         unassignedSeconds += addedSeconds;
                         drawSelectPage(); 
                     }
-                    else if (currentPage == PAGE_CHARGING || currentPage == PAGE_WIFI) {
+                    else if (currentPage == PAGE_CHARGING || currentPage == PAGE_WIFI || currentPage == PAGE_EXTEND) {
                         pendingCredits += coinValue;
                         unassignedSeconds += addedSeconds;
                         currentPage = PAGE_EXTEND;
