@@ -508,7 +508,59 @@ void setup() {
     currentPage = PAGE_INSERT;
     drawInsertPage();
 }
+void check_wifi_change_command() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
 
+    // Only check every 10 seconds to avoid hammering Firebase
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck < 10000) return;
+    lastCheck = millis();
+
+    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_change")) {
+        DynamicJsonDocument doc(256);
+        if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+
+        // Only act if the app set pending = true
+        if (!doc["pending"].as<bool>()) return;
+
+        String newSsid = doc["ssid"].as<String>();
+        String newPass = doc["pass"].as<String>();
+
+        if (newSsid.isEmpty()) return;
+
+        Serial.printf("[WiFi Change] New SSID: %s\n", newSsid.c_str());
+
+        // 1. Clear the command in Firebase so it doesn't re-trigger on next boot
+        FirebaseJson clearJson;
+        clearJson.set("pending", false);
+        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_change", &clearJson);
+
+        // 2. Show feedback on the TFT screen
+        tft.fillScreen(BG);
+        drawHeader();
+        tft.setCursor(10, 35);
+        tft.setTextColor(HL);
+        tft.println("WiFi Change");
+        tft.setCursor(10, 52);
+        tft.setTextColor(TXT);
+        tft.println("Saving & rebooting");
+        tft.setCursor(10, 68);
+        tft.setTextColor(OK);
+        tft.println(newSsid);
+        tft.drawRect(0, 0, 160, 128, TXT);
+        delay(800);
+
+        // 3. Save new credentials to master NVS
+        preferences.putString("ssid", newSsid);
+        preferences.putString("pass", newPass);
+
+        // 4. Forward to slave so it also reconnects to the new network
+        forwardWiFiToSlave(newSsid, newPass);
+
+        // 5. Reboot master — it will connect with the new credentials on next boot
+        ESP.restart();
+    }
+}
 // ================= LOOP =================
 void loop() {
     // Setup mode: only serve the config web page
@@ -693,4 +745,5 @@ void loop() {
 
     // ── 4. BACKGROUND TASKS ──────────────────────────────────────
     update_firebase();
+    check_wifi_change_command();
 }
