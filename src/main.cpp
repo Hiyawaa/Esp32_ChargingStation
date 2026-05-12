@@ -37,7 +37,7 @@ const int BTN_2_PIN         = 23;
 //       Common GND
 #define SLAVE_UART_TX   17
 #define SLAVE_UART_RX   16
-#define SLAVE_UART_BAUD 9600
+#define SLAVE_UART_BAUD 115200
 
 // ──────────────────────────────────────────────────────────────
 // UART COMMAND HELPERS
@@ -510,8 +510,6 @@ void setup() {
 }
 void check_wifi_change_command() {
     if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
-
-    // Only check every 10 seconds to avoid hammering Firebase
     static unsigned long lastCheck = 0;
     if (millis() - lastCheck < 10000) return;
     lastCheck = millis();
@@ -519,45 +517,65 @@ void check_wifi_change_command() {
     if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_change")) {
         DynamicJsonDocument doc(256);
         if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
-
-        // Only act if the app set pending = true
         if (!doc["pending"].as<bool>()) return;
 
         String newSsid = doc["ssid"].as<String>();
         String newPass = doc["pass"].as<String>();
-
         if (newSsid.isEmpty()) return;
 
         Serial.printf("[WiFi Change] New SSID: %s\n", newSsid.c_str());
 
-        // 1. Clear the command in Firebase so it doesn't re-trigger on next boot
-        FirebaseJson clearJson;
-        clearJson.set("pending", false);
+        FirebaseJson clearJson; clearJson.set("pending", false);
         Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_change", &clearJson);
 
-        // 2. Show feedback on the TFT screen
-        tft.fillScreen(BG);
-        drawHeader();
-        tft.setCursor(10, 35);
-        tft.setTextColor(HL);
-        tft.println("WiFi Change");
-        tft.setCursor(10, 52);
-        tft.setTextColor(TXT);
-        tft.println("Saving & rebooting");
-        tft.setCursor(10, 68);
-        tft.setTextColor(OK);
-        tft.println(newSsid);
+        tft.fillScreen(BG); drawHeader();
+        tft.setCursor(10, 35); tft.setTextColor(HL); tft.println("WiFi Change");
+        tft.setCursor(10, 52); tft.setTextColor(TXT); tft.println("Saving & rebooting");
+        tft.setCursor(10, 68); tft.setTextColor(OK); tft.println(newSsid);
         tft.drawRect(0, 0, 160, 128, TXT);
         delay(800);
 
-        // 3. Save new credentials to master NVS
         preferences.putString("ssid", newSsid);
         preferences.putString("pass", newPass);
-
-        // 4. Forward to slave so it also reconnects to the new network
         forwardWiFiToSlave(newSsid, newPass);
+        ESP.restart();
+    }
+}
+void check_wifi_reset_command() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck < 10000) return;
+    lastCheck = millis();
 
-        // 5. Reboot master — it will connect with the new credentials on next boot
+    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_reset")) {
+        DynamicJsonDocument doc(128);
+        if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+        if (!doc["pending"].as<bool>()) return;
+
+        Serial.println("[WiFi Reset] Wiping credentials and rebooting to Setup Mode...");
+
+        // 1. Clear the command node so it doesn't re-trigger
+        FirebaseJson clearJson; clearJson.set("pending", false);
+        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_reset", &clearJson);
+
+        // 2. Show feedback on TFT
+        tft.fillScreen(BG); drawHeader();
+        tft.setCursor(10, 35); tft.setTextColor(OFF);  tft.println("WiFi Reset!");
+        tft.setCursor(10, 52); tft.setTextColor(TXT);  tft.println("Clearing credentials");
+        tft.setCursor(10, 68); tft.setTextColor(HL);   tft.println("Reboot -> Setup Mode");
+        tft.drawRect(0, 0, 160, 128, TXT);
+        delay(800);
+
+        // 3. Wipe master NVS
+        preferences.putString("ssid", "");
+        preferences.putString("pass", "");
+
+        // 4. Tell slave to wipe its NVS too
+        //    Slave listens for "WIFI_RESET\n" and clears its own Preferences
+        Serial2.println("WIFI_RESET");
+        delay(1000);
+
+        // 5. Reboot master — empty ssid → setup() enters AP / Setup Mode
         ESP.restart();
     }
 }
