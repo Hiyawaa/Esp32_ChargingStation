@@ -24,7 +24,9 @@
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
 // ================= HARDWARE PINS =================
-const int METAL_SENSOR_PIN = 27;
+// GPIO 27 is ADC2 — unusable with analogRead() while WiFi is active.
+// Move the sensor wire to GPIO 34 (ADC1, input-only, WiFi-safe).
+const int METAL_SENSOR_PIN = 34;
 const int LED_PIN           = 25;
 const int BTN_1_PIN         = 22;
 const int BTN_2_PIN         = 23;
@@ -64,9 +66,45 @@ void setAllRelaysOff() {
 void forwardWiFiToSlave(const String& ssid, const String& pass) {
     // Format: "WIFI:<ssid>|<pass>\n"
     Serial2.printf("WIFI:%s|%s\n", ssid.c_str(), pass.c_str());
-    Serial.printf("[UART] Forwarded WiFi creds to slave: SSID=%s\n", ssid.c_str());
-    // Give the slave enough time to receive, write to NVS, and begin its reboot.
-    delay(1500);
+    Serial.printf("[UART→SLAVE] Sent WiFi creds  SSID='%s'  PASS='%s'\n",
+                  ssid.c_str(), pass.c_str());
+
+    // ── Wait for slave ACK ────────────────────────────────────
+    // Slave replies "ACK:WIFI:SAVED\n" after writing to NVS,
+    // or an ERR:* string if something went wrong.
+    // We allow up to 3 000 ms before declaring a timeout.
+    const unsigned long ACK_TIMEOUT_MS = 3000;
+    unsigned long       deadline       = millis() + ACK_TIMEOUT_MS;
+    String              reply          = "";
+
+    while (millis() < deadline) {
+        while (Serial2.available()) {
+            char c = (char)Serial2.read();
+            if (c == '\n') {
+                reply.trim();
+                if (reply.length() > 0) goto ack_done;
+                reply = "";          // skip blank lines
+            } else if (c != '\r') {
+                reply += c;
+            }
+        }
+        delay(10);
+    }
+
+ack_done:
+    if (reply == "ACK:WIFI:SAVED") {
+        Serial.println("[UART←SLAVE] ✓ ACK received — slave saved credentials & will reboot.");
+    } else if (reply.startsWith("ERR:")) {
+        Serial.printf("[UART←SLAVE] ✗ Slave returned error: %s\n", reply.c_str());
+    } else if (reply.length() == 0) {
+        Serial.println("[UART←SLAVE] ✗ TIMEOUT — no reply from slave within 3 s.");
+        Serial.println("             Check wiring (TX17→RX16) and slave firmware.");
+    } else {
+        Serial.printf("[UART←SLAVE] ? Unexpected reply: '%s'\n", reply.c_str());
+    }
+
+    // Give the slave's NVS write + reboot a moment to begin cleanly.
+    delay(500);
 }
 
 // ================= COIN SENSORS =================
@@ -108,6 +146,10 @@ bool          showText       = true;
 unsigned long lastBlink      = 0;
 unsigned long lastSecondTick = 0;
 
+// ── EXTEND / PORT-SELECT STATE ────────────────────────────────
+bool selectingPort   = false;   // true while user is picking a port to extend
+int  highlightedPort = -1;      // which port is currently highlighted in picker
+
 // ================= COLORS =================
 #define BG     ST77XX_BLACK
 #define TXT    ST77XX_WHITE
@@ -129,8 +171,22 @@ bool          needsFirebaseUpdate = false;
 unsigned long lastFirebaseUpdate  = 0;
 const unsigned long firebaseInterval = 3600000UL;
 
-int  lastMetalState = HIGH;
-bool metalDetected  = false;
+bool          metalDetected      = false;
+unsigned long metalDetectedTime  = 0;
+unsigned long metalLowStartTime  = 0;    // when reading first dropped below threshold
+bool          metalPinLow        = false; // true while reading is actively below threshold
+
+// ESP32 ADC: 0–4095 maps to 0–3.3 V
+// Metal present  → ~2.4 V → ADC ~2979
+// Metal absent   → ~3.3 V → ADC ~4095
+// Trigger threshold set at ~2.8 V (ADC ~3482) — comfortably between the two levels.
+// Lower this value if you want more sensitivity; raise it if you get false triggers.
+const int     METAL_ADC_THRESHOLD = 3000;
+
+// Pin must stay below threshold for this long before gate opens (noise filter)
+const unsigned long METAL_HOLD_MS    = 30;
+// Gate auto-closes if no coin arrives within this window after metal is released
+const unsigned long METAL_TIMEOUT_MS = 5000;
 
 struct CoinSetting {
     bool enabled;
@@ -183,6 +239,15 @@ void handleSetup() {
 }
 
 // ================= PORT HELPERS =================
+
+// Returns the index of the first port with remaining time, or -1 if none
+int firstActivePort() {
+    for (int i = 0; i < 4; i++) {
+        if (portSeconds[i] > 0) return i;
+    }
+    return -1;
+}
+
 int activateRandomPort(int timeToAdd) {
     int availablePorts[4];
     int availableCount = 0;
@@ -332,19 +397,88 @@ void drawWiFiPage() {
     tft.drawRect(0, 0, 160, 128, TXT);
 }
 
+// ──────────────────────────────────────────────────────────────
+// drawExtendPage()
+//
+// Shows pending coin value AND all currently active ports with
+// their remaining time so the user knows which ports exist
+// before deciding to extend or open a new one.
+// ──────────────────────────────────────────────────────────────
 void drawExtendPage() {
     tft.fillScreen(BG);
     drawHeader();
-    tft.setCursor(10, 40);
+
+    // Pending credits line
+    tft.setCursor(5, 22);
     tft.setTextColor(HL);
+    tft.setTextSize(1);
     tft.print("Added: P");
     tft.println(pendingCredits);
-    tft.setCursor(10, 70);
+
+    // List every active port with remaining time
+    int y = 38;
+    for (int i = 0; i < 4; i++) {
+        if (portSeconds[i] > 0) {
+            tft.setCursor(5, y);
+            tft.setTextColor(OK);
+            tft.printf("P%d ", i + 1);
+            tft.setTextColor(TXT);
+            tft.print(formatTime(portSeconds[i]));
+            y += 16;
+        }
+    }
+
+    // Bottom action hints
+    tft.setCursor(5, 100);
     tft.setTextColor(OK);
     tft.println("[1] Extend Time");
-    tft.setCursor(10, 90);
-    tft.setTextColor(TXT);
+    tft.setCursor(5, 112);
+    tft.setTextColor(HL);
     tft.println("[2] New Port");
+    tft.drawRect(0, 0, 160, 128, TXT);
+}
+
+// ──────────────────────────────────────────────────────────────
+// drawPortSelectPage()
+//
+// Shown when the user pressed [1] on the extend page.
+// Scrolls a highlight marker through active ports so the user
+// can pick exactly which port receives the extra time.
+// ──────────────────────────────────────────────────────────────
+void drawPortSelectPage(int highlighted) {
+    tft.fillScreen(BG);
+    drawHeader();
+
+    tft.setCursor(5, 22);
+    tft.setTextColor(HL);
+    tft.setTextSize(1);
+    tft.println("Select Port:");
+
+    int y = 38;
+    for (int i = 0; i < 4; i++) {
+        if (portSeconds[i] > 0) {
+            tft.setCursor(5, y);
+            if (i == highlighted) {
+                tft.setTextColor(OK);
+                tft.print("> PORT ");
+            } else {
+                tft.setTextColor(TXT);
+                tft.print("  PORT ");
+            }
+            tft.print(i + 1);
+            tft.print("  ");
+            tft.setTextColor(HL);
+            tft.println(formatTime(portSeconds[i]));
+            y += 16;
+        }
+    }
+
+    tft.setCursor(5, 100);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.println("[1] Confirm");
+    tft.setCursor(5, 112);
+    tft.setTextColor(TXT);
+    tft.println("[2] Next port");
     tft.drawRect(0, 0, 160, 128, TXT);
 }
 
@@ -425,7 +559,7 @@ void setup() {
     // --- GPIO: sensors, LED, buttons, coin inputs ---
     // (No relay pinMode — relays are managed entirely by the slave ESP32)
     pinMode(LED_PIN, OUTPUT);
-    pinMode(METAL_SENSOR_PIN, INPUT_PULLUP);
+    pinMode(METAL_SENSOR_PIN, INPUT);   // GPIO 34: ADC1, input-only, no pull resistors
     pinMode(BTN_1_PIN, INPUT_PULLDOWN);
     pinMode(BTN_2_PIN, INPUT_PULLDOWN);
     for (auto const& [name, data] : coinData) {
@@ -508,6 +642,8 @@ void setup() {
     currentPage = PAGE_INSERT;
     drawInsertPage();
 }
+
+// ================= FIREBASE REMOTE COMMANDS =================
 void check_wifi_change_command() {
     if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
     static unsigned long lastCheck = 0;
@@ -541,44 +677,56 @@ void check_wifi_change_command() {
         ESP.restart();
     }
 }
-void check_wifi_reset_command() {
+
+void check_wifi_show_command() {
     if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
     static unsigned long lastCheck = 0;
     if (millis() - lastCheck < 10000) return;
     lastCheck = millis();
 
-    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_reset")) {
+    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_show")) {
         DynamicJsonDocument doc(128);
         if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
         if (!doc["pending"].as<bool>()) return;
 
-        Serial.println("[WiFi Reset] Wiping credentials and rebooting to Setup Mode...");
-
-        // 1. Clear the command node so it doesn't re-trigger
+        // 1. Clear the command so it only fires once
         FirebaseJson clearJson; clearJson.set("pending", false);
-        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_reset", &clearJson);
+        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_show", &clearJson);
 
-        // 2. Show feedback on TFT
-        tft.fillScreen(BG); drawHeader();
-        tft.setCursor(10, 35); tft.setTextColor(OFF);  tft.println("WiFi Reset!");
-        tft.setCursor(10, 52); tft.setTextColor(TXT);  tft.println("Clearing credentials");
-        tft.setCursor(10, 68); tft.setTextColor(HL);   tft.println("Reboot -> Setup Mode");
-        tft.drawRect(0, 0, 160, 128, TXT);
-        delay(800);
+        // 2. Read saved SSID from NVS (password intentionally hidden for security)
+        String savedSsid = preferences.getString("ssid", "(not set)");
 
-        // 3. Wipe master NVS
-        preferences.putString("ssid", "");
-        preferences.putString("pass", "");
+        // 3. Display on TFT
+        tft.fillScreen(BG);
+        drawHeader();
+        tft.setCursor(10, 28); tft.setTextColor(HL);  tft.setTextSize(1);
+        tft.println("WiFi Credentials");
+        tft.setCursor(10, 45); tft.setTextColor(TXT);
+        tft.println("Connected Network:");
+        tft.setCursor(10, 58); tft.setTextColor(OK);  tft.setTextSize(1);
+        tft.println(savedSsid);
+        tft.setCursor(10, 76); tft.setTextColor(TXT);
+        tft.println("Password: ********");
+        tft.setCursor(10, 96); tft.setTextColor(ST77XX_CYAN);
+        tft.println("(Saved in memory)");
+        tft.drawRect(0, 0, 160, 128, HL);
 
-        // 4. Tell slave to wipe its NVS too
-        //    Slave listens for "WIFI_RESET\n" and clears its own Preferences
-        Serial2.println("WIFI_RESET");
-        delay(1000);
-
-        // 5. Reboot master — empty ssid → setup() enters AP / Setup Mode
-        ESP.restart();
+        // 4. Hold for 5 seconds then redraw the normal page
+        delay(5000);
+        switch (currentPage) {
+            case PAGE_INSERT:   drawInsertPage();   break;
+            case PAGE_SELECT:   drawSelectPage();   break;
+            case PAGE_CHARGING: drawChargingPage(); break;
+            case PAGE_WIFI:     drawWiFiPage();     break;
+            case PAGE_EXTEND:
+                if (selectingPort) drawPortSelectPage(highlightedPort);
+                else               drawExtendPage();
+                break;
+            default: drawInsertPage(); break;
+        }
     }
 }
+
 // ================= LOOP =================
 void loop() {
     // Setup mode: only serve the config web page
@@ -587,29 +735,79 @@ void loop() {
         return;
     }
 
-    // ── 1. METAL SENSOR ──────────────────────────────────────────
-    int metalState = digitalRead(METAL_SENSOR_PIN);
-    if (metalState != lastMetalState) {
-        if (metalState == LOW) metalDetected = true;
-        lastMetalState = metalState;
-        delay(50);
+    // ── 1. METAL SENSOR (analog) ─────────────────────────────────
+    // digitalRead() cannot detect the 3.3→2.4 V drop from this sensor
+    // because 2.4 V is still above the ESP32 HIGH threshold (~1.8 V).
+    // analogRead() gives us the actual voltage level so we can set our
+    // own threshold between the idle voltage and the metal-present voltage.
+    {
+        int metalADC = analogRead(METAL_SENSOR_PIN);
+        bool metalBelow = (metalADC < METAL_ADC_THRESHOLD);
+
+        if (metalBelow) {
+            if (!metalPinLow) {
+                // Reading just dropped below threshold — start hold timer
+                metalPinLow       = true;
+                metalLowStartTime = millis();
+                Serial.printf("[METAL] Below threshold (ADC=%d) — starting hold timer\n",
+                              metalADC);
+            } else if (!metalDetected &&
+                       (millis() - metalLowStartTime >= METAL_HOLD_MS)) {
+                // Held below threshold long enough — open the gate
+                metalDetected     = true;
+                metalDetectedTime = millis();
+                Serial.printf("[METAL] Confirmed (ADC=%d) — coin gate OPEN\n", metalADC);
+            }
+        } else {
+            // Reading back above threshold — metal has passed
+            if (metalPinLow) {
+                Serial.printf("[METAL] Released (ADC=%d)\n", metalADC);
+            }
+            metalPinLow = false;
+            // Do NOT clear metalDetected — coin IR must consume it or timeout expires it
+        }
+
+        // Auto-expire: gate open too long with no coin following
+        if (metalDetected && (millis() - metalDetectedTime > METAL_TIMEOUT_MS)) {
+            metalDetected = false;
+            metalPinLow   = false;
+            Serial.println("[METAL] Gate expired — CLOSED (timeout)");
+        }
+
+        // Continuous debug — comment out after tuning is done
+        static unsigned long lastADCPrint = 0;
+        if (millis() - lastADCPrint > 500) {
+            lastADCPrint = millis();
+            Serial.printf("[METAL DEBUG] ADC=%d  (%.2fV)  gate=%s\n",
+                          metalADC,
+                          metalADC * 3.3f / 4095.0f,
+                          metalDetected ? "OPEN" : "closed");
+        }
     }
 
     // ── 2. COIN SENSOR POLLING ───────────────────────────────────
+    // Require the IR pin to stay LOW for 10 ms to reject noise glitches.
     for (auto& [name, data] : coinData) {
         int currentState = digitalRead(data.pin);
 
         if (currentState == LOW && data.lastState == HIGH) {
-            delay(5);
+            delay(10); // hold-time check — must still be LOW after 10 ms
             if (digitalRead(data.pin) == LOW) {
 
                 if (metalDetected && coinSettings[name].enabled) {
+                    Serial.printf("[COIN] Accepted P%s (metal age: %lu ms)\n",
+                                  name.c_str(), millis() - metalDetectedTime);
+
+                    metalDetected = false; // one metal detection = one coin only
+                    metalPinLow   = false;
+                    Serial.println("[METAL] Gate consumed — CLOSED");
+
                     data.count++;
                     save_data();
                     needsFirebaseUpdate = true;
 
-                    int coinValue     = name.toInt();
-                    int addedSeconds  = coinSettings[name].time * 60;
+                    int coinValue    = name.toInt();
+                    int addedSeconds = coinSettings[name].time * 60;
 
                     if (currentPage == PAGE_INSERT) {
                         credits           += coinValue;
@@ -627,11 +825,22 @@ void loop() {
                              currentPage == PAGE_EXTEND) {
                         pendingCredits    += coinValue;
                         unassignedSeconds += addedSeconds;
+
+                        // A new coin interrupts any in-progress port selection
+                        // and brings the user back to the extend choice screen.
+                        selectingPort   = false;
+                        highlightedPort = -1;
+
                         currentPage = PAGE_EXTEND;
                         drawExtendPage();
                     }
 
-                    metalDetected = false;
+                } else if (!metalDetected) {
+                    Serial.printf("[COIN] REJECTED P%s — gate closed (no metal)\n",
+                                  name.c_str());
+                } else if (!coinSettings[name].enabled) {
+                    Serial.printf("[COIN] REJECTED P%s — disabled in settings\n",
+                                  name.c_str());
                 }
             }
         }
@@ -736,32 +945,105 @@ void loop() {
     }
 
     // PAGE: EXTEND — coin inserted mid-session
+    // ──────────────────────────────────────────────────────────────
+    // Two sub-states controlled by the `selectingPort` flag:
+    //
+    //  selectingPort == false  →  Main extend screen
+    //    [BTN_1]  Enter port-select mode  (extend time on a specific port)
+    //    [BTN_2]  Activate a new free port; if all ports full → enter port-select
+    //
+    //  selectingPort == true   →  Port picker screen
+    //    [BTN_2]  Cycle the highlight to the next active port
+    //    [BTN_1]  Confirm: add unassignedSeconds to the highlighted port
+    // ──────────────────────────────────────────────────────────────
     else if (currentPage == PAGE_EXTEND) {
-        if (digitalRead(BTN_1_PIN) == HIGH) {
-            portSeconds[lastActivatedPort] += unassignedSeconds;
-            credits          += pendingCredits;
-            unassignedSeconds = 0;
-            pendingCredits    = 0;
 
-            currentPage    = PAGE_CHARGING;
-            lastSecondTick = millis();
-            drawChargingPage();
-            delay(300);
+        // ── SUB-STATE: port picker ────────────────────────────────
+        if (selectingPort) {
+
+            // BTN_2 → move highlight to next active port
+            if (digitalRead(BTN_2_PIN) == HIGH) {
+                // Search for the next active port after the current highlight
+                int next = -1;
+                for (int i = 1; i <= 4; i++) {
+                    int candidate = (highlightedPort + i) % 4;
+                    if (portSeconds[candidate] > 0) {
+                        next = candidate;
+                        break;
+                    }
+                }
+                // Only redraw if we actually moved to a different port
+                if (next != -1 && next != highlightedPort) {
+                    highlightedPort = next;
+                    drawPortSelectPage(highlightedPort);
+                }
+                delay(300);
+            }
+
+            // BTN_1 → confirm selection, add time, return to charging
+            else if (digitalRead(BTN_1_PIN) == HIGH) {
+                portSeconds[highlightedPort] += unassignedSeconds;
+                credits          += pendingCredits;
+                unassignedSeconds = 0;
+                pendingCredits    = 0;
+                selectingPort     = false;
+                highlightedPort   = -1;
+
+                currentPage    = PAGE_CHARGING;
+                lastSecondTick = millis();
+                drawChargingPage();
+                delay(300);
+            }
         }
-        else if (digitalRead(BTN_2_PIN) == HIGH) {
-            activateRandomPort(unassignedSeconds);
-            credits          += pendingCredits;
-            unassignedSeconds = 0;
-            pendingCredits    = 0;
 
-            currentPage    = PAGE_CHARGING;
-            lastSecondTick = millis();
-            drawChargingPage();
-            delay(300);
+        // ── SUB-STATE: extend / new-port choice ──────────────────
+        else {
+
+            // BTN_1 → enter port-select mode so user picks which port to extend
+            if (digitalRead(BTN_1_PIN) == HIGH) {
+                int fp = firstActivePort();
+                if (fp != -1) {
+                    selectingPort   = true;
+                    highlightedPort = fp;
+                    drawPortSelectPage(highlightedPort);
+                }
+                delay(300);
+            }
+
+            // BTN_2 → try to open a brand-new port
+            else if (digitalRead(BTN_2_PIN) == HIGH) {
+                // Check how many ports are truly free
+                int available = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (!portActive[i] && portSeconds[i] <= 0) available++;
+                }
+
+                if (available > 0) {
+                    // At least one free port → activate it immediately
+                    activateRandomPort(unassignedSeconds);
+                    credits          += pendingCredits;
+                    unassignedSeconds = 0;
+                    pendingCredits    = 0;
+
+                    currentPage    = PAGE_CHARGING;
+                    lastSecondTick = millis();
+                    drawChargingPage();
+                } else {
+                    // All 4 ports busy → fall through to port-select for extension
+                    int fp = firstActivePort();
+                    if (fp != -1) {
+                        selectingPort   = true;
+                        highlightedPort = fp;
+                        drawPortSelectPage(highlightedPort);
+                    }
+                }
+                delay(300);
+            }
         }
     }
 
     // ── 4. BACKGROUND TASKS ──────────────────────────────────────
     update_firebase();
     check_wifi_change_command();
+    check_wifi_show_command();
 }
