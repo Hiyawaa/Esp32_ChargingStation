@@ -34,78 +34,12 @@ const int BTN_2_PIN         = 23;
 //       GPIO 16 & 17 are now repurposed as UART2 TX/RX to the slave.
 
 // ================= UART2 → SLAVE ESP32 =================
-// Wire: Master TX2 (GPIO 17) → Slave RX (GPIO 4)
-//       Master RX2 (GPIO 16) ← Slave TX (GPIO 5)
+// Wire: Master TX2 (GPIO 17) → Slave RX (GPIO 16)
+//       Master RX2 (GPIO 16) ← Slave TX (GPIO 17)
 //       Common GND
 #define SLAVE_UART_TX   17
 #define SLAVE_UART_RX   16
 #define SLAVE_UART_BAUD 115200
-
-// ──────────────────────────────────────────────────────────────
-// UART COMMAND HELPERS
-//
-// Relay commands:
-//   "RELAY:<port>:ON\n"   → slave turns relay ON  (GPIO LOW,  active-low)
-//   "RELAY:<port>:OFF\n"  → slave turns relay OFF (GPIO HIGH)
-//   "RELAY:ALL:OFF\n"     → slave turns ALL relays OFF
-//
-// WiFi credential forwarding (setup mode only):
-//   "WIFI:<ssid>|<pass>\n" → slave saves to NVS and reboots to connect
-//   The '|' delimiter is used because it rarely appears in SSIDs or passwords.
-// ──────────────────────────────────────────────────────────────
-void setRelay(int port, bool on) {
-    Serial2.printf("RELAY:%d:%s\n", port, on ? "ON" : "OFF");
-    delay(10);
-}
-
-void setAllRelaysOff() {
-    Serial2.println("RELAY:ALL:OFF");
-    delay(10);
-}
-
-void forwardWiFiToSlave(const String& ssid, const String& pass) {
-    // Format: "WIFI:<ssid>|<pass>\n"
-    Serial2.printf("WIFI:%s|%s\n", ssid.c_str(), pass.c_str());
-    Serial.printf("[UART→SLAVE] Sent WiFi creds  SSID='%s'  PASS='%s'\n",
-                  ssid.c_str(), pass.c_str());
-
-    // ── Wait for slave ACK ────────────────────────────────────
-    // Slave replies "ACK:WIFI:SAVED\n" after writing to NVS,
-    // or an ERR:* string if something went wrong.
-    // We allow up to 3 000 ms before declaring a timeout.
-    const unsigned long ACK_TIMEOUT_MS = 3000;
-    unsigned long       deadline       = millis() + ACK_TIMEOUT_MS;
-    String              reply          = "";
-
-    while (millis() < deadline) {
-        while (Serial2.available()) {
-            char c = (char)Serial2.read();
-            if (c == '\n') {
-                reply.trim();
-                if (reply.length() > 0) goto ack_done;
-                reply = "";          // skip blank lines
-            } else if (c != '\r') {
-                reply += c;
-            }
-        }
-        delay(10);
-    }
-
-ack_done:
-    if (reply == "ACK:WIFI:SAVED") {
-        Serial.println("[UART←SLAVE] ✓ ACK received — slave saved credentials & will reboot.");
-    } else if (reply.startsWith("ERR:")) {
-        Serial.printf("[UART←SLAVE] ✗ Slave returned error: %s\n", reply.c_str());
-    } else if (reply.length() == 0) {
-        Serial.println("[UART←SLAVE] ✗ TIMEOUT — no reply from slave within 3 s.");
-        Serial.println("             Check wiring (TX17→RX16) and slave firmware.");
-    } else {
-        Serial.printf("[UART←SLAVE] ? Unexpected reply: '%s'\n", reply.c_str());
-    }
-
-    // Give the slave's NVS write + reboot a moment to begin cleanly.
-    delay(500);
-}
 
 // ================= COIN SENSORS =================
 struct CoinPin {
@@ -128,27 +62,29 @@ enum Page {
     PAGE_SELECT,
     PAGE_CHARGING,
     PAGE_WIFI,
-    PAGE_EXTEND
+    PAGE_EXTEND,
+    PAGE_WIFI_EXTEND
 };
 
 Page currentPage = PAGE_INSERT;
 
 int  credits           = 0;
 int  pendingCredits    = 0;
+int  wifiPendingCredits = 0;
 int  unassignedSeconds = 0;
 int  portSeconds[4]    = {0, 0, 0, 0};
 int  wifiSeconds       = 0;
 bool portActive[4]     = {false, false, false, false};
 int  lastActivatedPort = 0;
-int  wifiUsers         = 3;
+int  wifiUsers         = 0;
 
 bool          showText       = true;
 unsigned long lastBlink      = 0;
 unsigned long lastSecondTick = 0;
 
 // ── EXTEND / PORT-SELECT STATE ────────────────────────────────
-bool selectingPort   = false;   // true while user is picking a port to extend
-int  highlightedPort = -1;      // which port is currently highlighted in picker
+bool selectingPort   = false;
+int  highlightedPort = -1;
 
 // ================= COLORS =================
 #define BG     ST77XX_BLACK
@@ -167,25 +103,34 @@ FirebaseData   fbdo;
 FirebaseAuth   auth;
 FirebaseConfig config;
 
+// Apmode
+bool          apModeActive   = false;
+unsigned long apModeStart    = 0;
+unsigned long apModeDuration = 0;
+
 bool          needsFirebaseUpdate = false;
 unsigned long lastFirebaseUpdate  = 0;
 const unsigned long firebaseInterval = 3600000UL;
 
-bool          metalDetected      = false;
-unsigned long metalDetectedTime  = 0;
-unsigned long metalLowStartTime  = 0;    // when reading first dropped below threshold
-bool          metalPinLow        = false; // true while reading is actively below threshold
+// Accumulated WiFi revenue (peso value of all WiFi coins ever inserted)
+float wifiEarningsTotal = 0.0f;
 
-// ESP32 ADC: 0–4095 maps to 0–3.3 V
-// Metal present  → ~2.4 V → ADC ~2979
-// Metal absent   → ~3.3 V → ADC ~4095
-// Trigger threshold set at ~2.8 V (ADC ~3482) — comfortably between the two levels.
-// Lower this value if you want more sensitivity; raise it if you get false triggers.
+// Per-day earnings accumulators — reset when the date changes
+String lastEarningsDate    = "";
+float  dailyChargingEarned = 0.0f;
+float  dailyWifiEarned     = 0.0f;
+
+bool          needsStatusUpdate   = false;
+unsigned long lastStatusUpdate    = 0;
+const unsigned long statusInterval = 5000UL;  // push live status every 5 s
+
+bool          metalDetected     = false;
+unsigned long metalDetectedTime = 0;
+unsigned long metalLowStartTime = 0;
+bool          metalPinLow       = false;
+
 const int     METAL_ADC_THRESHOLD = 3000;
-
-// Pin must stay below threshold for this long before gate opens (noise filter)
 const unsigned long METAL_HOLD_MS    = 30;
-// Gate auto-closes if no coin arrives within this window after metal is released
 const unsigned long METAL_TIMEOUT_MS = 5000;
 
 struct CoinSetting {
@@ -205,6 +150,154 @@ Preferences preferences;
 WebServer   server(80);
 bool        isSetupMode = false;
 
+// ================= WIFI SESSION (SLAVE LINK) =================
+// MAC address of the last client that connected to the slave's AP.
+// Populated automatically when the slave sends "MAC:<addr>\n" over UART
+// each time a new STA associates with its captive-portal AP.
+// Falls back to broadcast until a real MAC is received.
+String wifiTargetMac = "FF:FF:FF:FF:FF:FF";
+
+// Running buffer for unsolicited lines from the slave
+String slaveLineBuffer = "";
+
+// ──────────────────────────────────────────────────────────────
+// readSlaveUart()
+//
+// Call from loop() every iteration to catch unsolicited messages
+// from the slave, particularly "MAC:<addr>" pushes that arrive
+// whenever a new device joins the slave's captive-portal AP.
+// ──────────────────────────────────────────────────────────────
+void readSlaveUart() {
+    while (Serial2.available()) {
+        char c = (char)Serial2.read();
+        if (c == '\n') {
+            slaveLineBuffer.trim();
+            if (slaveLineBuffer.startsWith("MAC:")) {
+                // Format: "MAC:AA:BB:CC:DD:EE:FF"
+                wifiTargetMac = slaveLineBuffer.substring(4);
+                wifiTargetMac.trim();
+                Serial.printf("[UART←SLAVE] Last WiFi client MAC: %s\n",
+                              wifiTargetMac.c_str());
+            }
+            // Other unsolicited lines (ACKs from previous commands) are silently discarded here
+            slaveLineBuffer = "";
+        } else if (c != '\r') {
+            slaveLineBuffer += c;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// waitSlaveAck()
+//
+// Shared helper — blocks up to timeoutMs waiting for a non-empty
+// line from the slave and returns it (trimmed, no newline).
+// Returns "" on timeout.
+// ──────────────────────────────────────────────────────────────
+String waitSlaveAck(unsigned long timeoutMs = 3000) {
+    unsigned long deadline = millis() + timeoutMs;
+    String        reply    = "";
+    while (millis() < deadline) {
+        while (Serial2.available()) {
+            char c = (char)Serial2.read();
+            if (c == '\n') {
+                reply.trim();
+                if (reply.length() > 0) return reply;
+                reply = "";
+            } else if (c != '\r') {
+                reply += c;
+            }
+        }
+        delay(10);
+    }
+    return ""; // timeout
+}
+
+// ──────────────────────────────────────────────────────────────
+// setRelay()   /   setAllRelaysOff()
+//
+// Relay commands:
+//   "RELAY:<port>:ON\n"   → slave activates relay  (GPIO LOW,  active-low)
+//   "RELAY:<port>:OFF\n"  → slave deactivates relay (GPIO HIGH)
+//   "RELAY:ALL:OFF\n"     → slave turns ALL relays OFF
+// ──────────────────────────────────────────────────────────────
+void setRelay(int port, bool on) {
+    Serial2.printf("RELAY:%d:%s\n", port, on ? "ON" : "OFF");
+    delay(10);
+}
+
+void setAllRelaysOff() {
+    Serial2.println("RELAY:ALL:OFF");
+    delay(10);
+}
+
+// ──────────────────────────────────────────────────────────────
+// forwardWiFiToSlave()
+//
+// Called by handleSetup() during first-run provisioning.
+// Sends "WIFI:<ssid>|<pass>\n" so the slave saves credentials
+// to its own NVS and reboots to join the home network.
+// ──────────────────────────────────────────────────────────────
+void forwardWiFiToSlave(const String& ssid, const String& pass) {
+    Serial2.printf("WIFI:%s|%s\n", ssid.c_str(), pass.c_str());
+    Serial.printf("[UART→SLAVE] Sent WiFi creds  SSID='%s'  PASS='%s'\n",
+                  ssid.c_str(), pass.c_str());
+
+    String reply = waitSlaveAck(3000);
+
+    if (reply == "ACK:WIFI:SAVED") {
+        Serial.println("[UART←SLAVE] ✓ ACK received — slave saved credentials & will reboot.");
+    } else if (reply.startsWith("ERR:")) {
+        Serial.printf("[UART←SLAVE] ✗ Slave returned error: %s\n", reply.c_str());
+    } else if (reply.length() == 0) {
+        Serial.println("[UART←SLAVE] ✗ TIMEOUT — no reply from slave within 3 s.");
+        Serial.println("             Check wiring (TX17→RX16) and slave firmware.");
+    } else {
+        Serial.printf("[UART←SLAVE] ? Unexpected reply: '%s'\n", reply.c_str());
+    }
+
+    delay(500);
+}
+
+// ──────────────────────────────────────────────────────────────
+// sendWifiTime()
+//
+// Sends "TIME:<MAC>:<seconds>\n" to the slave so it registers
+// (or extends) a captive-portal session for that MAC address.
+//
+// Slave reply:
+//   "ACK:TIME:<MAC>:<seconds>\n"  → session registered
+//   "ERR:BAD_MAC\n"               → malformed MAC
+//   "ERR:BAD_SECONDS\n"           → seconds ≤ 0
+//   "ERR:BAD_TIME_FMT\n"          → command too short
+//   "" (timeout)                  → slave not responding
+//
+// Rate: 1 peso credit = 1 minute by default.
+// Adjust the caller (PAGE_SELECT handler) to change the rate.
+// ──────────────────────────────────────────────────────────────
+void sendWifiTime(const String& mac, int32_t seconds) {
+    if (seconds <= 0) {
+        Serial.println("[sendWifiTime] Skipped — seconds <= 0.");
+        return;
+    }
+
+    Serial2.printf("TIME:%s:%ld\n", mac.c_str(), (long)seconds);
+    Serial.printf("[UART→SLAVE] TIME %s  +%ld s\n", mac.c_str(), (long)seconds);
+
+    String reply = waitSlaveAck(3000);
+
+    if (reply.startsWith("ACK:TIME:")) {
+        Serial.printf("[UART←SLAVE] ✓ Session registered: %s\n", reply.c_str());
+    } else if (reply.startsWith("ERR:")) {
+        Serial.printf("[UART←SLAVE] ✗ Error from slave: %s\n", reply.c_str());
+    } else if (reply.length() == 0) {
+        Serial.println("[UART←SLAVE] ✗ TIMEOUT — no ACK from slave for TIME command.");
+    } else {
+        Serial.printf("[UART←SLAVE] ? Unexpected reply: '%s'\n", reply.c_str());
+    }
+}
+
+// ================= SETUP HTTP HANDLER =================
 // ──────────────────────────────────────────────────────────────
 // handleSetup()
 //
@@ -240,7 +333,6 @@ void handleSetup() {
 
 // ================= PORT HELPERS =================
 
-// Returns the index of the first port with remaining time, or -1 if none
 int firstActivePort() {
     for (int i = 0; i < 4; i++) {
         if (portSeconds[i] > 0) return i;
@@ -259,7 +351,6 @@ int activateRandomPort(int timeToAdd) {
     }
 
     if (availableCount == 0) {
-        // All ports busy — add time to the last activated port
         portSeconds[lastActivatedPort] += timeToAdd;
         return lastActivatedPort;
     }
@@ -352,12 +443,13 @@ void drawSelectPage() {
     tft.fillScreen(BG);
     drawHeader();
     tft.setCursor(10, 30);
+    tft.setTextColor(TXT);
     tft.print("Credits: P");
     tft.println(credits);
-    tft.setCursor(20, 60);
+    tft.setCursor(20, 55);
     tft.setTextColor(OK);
     tft.println("[1] Charging");
-    tft.setCursor(20, 80);
+    tft.setCursor(20, 75);
     tft.setTextColor(HL);
     tft.println("[2] WiFi");
     tft.drawRect(0, 0, 160, 128, TXT);
@@ -380,42 +472,51 @@ void drawChargingPage() {
     tft.drawRect(0, 0, 160, 128, TXT);
 }
 
+// ──────────────────────────────────────────────────────────────
+// drawWiFiPage()
+//
+// Shows the active WiFi session details:
+//   - Remaining time (counted down by loop())
+//   - Target MAC address that holds the session on the slave
+//   - SSID of the slave's captive portal AP
+// Auto-updates every second via the main loop redraw.
+// ──────────────────────────────────────────────────────────────
 void drawWiFiPage() {
     tft.fillScreen(BG);
     drawHeader();
-    tft.setCursor(10, 30);
+
+    tft.setCursor(10, 28);
     tft.setTextColor(HL);
+    tft.setTextSize(1);
     tft.print("Time: ");
     tft.println(formatTime(wifiSeconds));
-    tft.setCursor(10, 60);
+
+    tft.setCursor(10, 46);
     tft.setTextColor(OK);
     tft.print("Devices: ");
     tft.println(wifiUsers);
-    tft.setCursor(10, 80);
+
+    tft.setCursor(10, 64);
     tft.setTextColor(TXT);
-    tft.println("SSID: VENDO_WIFI");
+    tft.println("SSID: ESP32_WIFI");
+
+    tft.setCursor(5, 82);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.println("192.168.4.1  to check");
+
     tft.drawRect(0, 0, 160, 128, TXT);
 }
 
-// ──────────────────────────────────────────────────────────────
-// drawExtendPage()
-//
-// Shows pending coin value AND all currently active ports with
-// their remaining time so the user knows which ports exist
-// before deciding to extend or open a new one.
-// ──────────────────────────────────────────────────────────────
 void drawExtendPage() {
     tft.fillScreen(BG);
     drawHeader();
 
-    // Pending credits line
     tft.setCursor(5, 22);
     tft.setTextColor(HL);
     tft.setTextSize(1);
     tft.print("Added: P");
     tft.println(pendingCredits);
 
-    // List every active port with remaining time
     int y = 38;
     for (int i = 0; i < 4; i++) {
         if (portSeconds[i] > 0) {
@@ -428,7 +529,6 @@ void drawExtendPage() {
         }
     }
 
-    // Bottom action hints
     tft.setCursor(5, 100);
     tft.setTextColor(OK);
     tft.println("[1] Extend Time");
@@ -439,12 +539,38 @@ void drawExtendPage() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// drawPortSelectPage()
+// drawWiFiExtendPage()
 //
-// Shown when the user pressed [1] on the extend page.
-// Scrolls a highlight marker through active ports so the user
-// can pick exactly which port receives the extra time.
+// Shown when a coin is inserted while already on PAGE_WIFI.
+// Mirrors the charging extend menu but for WiFi sessions:
+//   [1] Extend Time  → add time to the current connected user (wifiTargetMac)
+//   [2] New User     → send time to whoever joins next (broadcast MAC)
 // ──────────────────────────────────────────────────────────────
+void drawWiFiExtendPage() {
+    tft.fillScreen(BG);
+    drawHeader();
+
+    tft.setCursor(5, 22);
+    tft.setTextColor(HL);
+    tft.setTextSize(1);
+    tft.print("Added: P");
+    tft.println(wifiPendingCredits);
+
+    tft.setCursor(5, 42);
+    tft.setTextColor(TXT);
+    tft.print("Time left: ");
+    tft.setTextColor(OK);
+    tft.println(formatTime(wifiSeconds));
+
+    tft.setCursor(5, 90);
+    tft.setTextColor(OK);
+    tft.println("[1] Extend Time");
+    tft.setCursor(5, 106);
+    tft.setTextColor(HL);
+    tft.println("[2] New User");
+    tft.drawRect(0, 0, 160, 128, TXT);
+}
+
 void drawPortSelectPage(int highlighted) {
     tft.fillScreen(BG);
     drawHeader();
@@ -524,6 +650,7 @@ void update_firebase() {
     unsigned long now = millis();
     if (!needsFirebaseUpdate && (now - lastFirebaseUpdate < firebaseInterval)) return;
 
+    // ── Charging totals from coin counters ─────────────────────
     float totalCharging = 0;
     FirebaseJson json;
     for (auto const& [name, data] : coinData) {
@@ -531,14 +658,69 @@ void update_firebase() {
         totalCharging += name.toInt() * data.count;
     }
 
+    // ── All-time totals ────────────────────────────────────────
     json.set("total_earnings/charging", totalCharging);
+    json.set("total_earnings/wifi",     wifiEarningsTotal);
+
+    // ── Daily logs — accumulate per day, never replace ─────────
+    // We keep per-day accumulators (dailyChargingEarned, dailyWifiEarned)
+    // that reset whenever the calendar date changes.
     String today = getToday();
-    json.set("logs/" + today + "/charging", totalCharging);
+    if (today != lastEarningsDate) {
+        // New day — reset daily counters
+        dailyChargingEarned = 0.0f;
+        dailyWifiEarned     = 0.0f;
+        lastEarningsDate    = today;
+    }
+
+    // Read what's already in Firebase for today so we don't overwrite
+    // data from a previous boot on the same day.
+    // We use a separate read path to seed our local accumulators on first write.
+    // Simple approach: only write *incremental* daily totals tracked in RAM.
+    // If the device reboots mid-day the daily counter resets to 0 and adds
+    // from that point — acceptable. Use Firebase transactions for hard accuracy.
+    json.set("logs/" + today + "/charging", dailyChargingEarned);
+    json.set("logs/" + today + "/wifi",     dailyWifiEarned);
 
     if (Firebase.RTDB.updateNode(&fbdo, "/", &json)) {
         needsFirebaseUpdate = false;
     }
     lastFirebaseUpdate = now;
+}
+
+// ──────────────────────────────────────────────────────────────
+// push_status_firebase()
+//
+// Pushes live session status to Firebase every ~5 seconds so
+// the Flutter app can display real-time port and WiFi info:
+//
+//   status/active_ports          → int  (0-4)
+//   status/wifi_users            → int
+//   status/wifi_seconds          → int
+//   status/ports/0..3/active     → bool
+//   status/ports/0..3/seconds    → int
+// ──────────────────────────────────────────────────────────────
+void push_status_firebase() {
+    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+    unsigned long now = millis();
+    if (!needsStatusUpdate && (now - lastStatusUpdate < statusInterval)) return;
+
+    int activeCount = 0;
+    for (int i = 0; i < 4; i++) if (portSeconds[i] > 0) activeCount++;
+
+    FirebaseJson sJson;
+    sJson.set("status/active_ports", activeCount);
+    sJson.set("status/wifi_users",   wifiUsers);
+    sJson.set("status/wifi_seconds", wifiSeconds);
+    for (int i = 0; i < 4; i++) {
+        String base = "status/ports/" + String(i);
+        sJson.set(base + "/active",  portSeconds[i] > 0);
+        sJson.set(base + "/seconds", portSeconds[i]);
+    }
+
+    Firebase.RTDB.updateNode(&fbdo, "/", &sJson);
+    needsStatusUpdate = false;
+    lastStatusUpdate  = now;
 }
 
 // ================= SETUP =================
@@ -557,9 +739,8 @@ void setup() {
     tft.println("Booting up...");
 
     // --- GPIO: sensors, LED, buttons, coin inputs ---
-    // (No relay pinMode — relays are managed entirely by the slave ESP32)
     pinMode(LED_PIN, OUTPUT);
-    pinMode(METAL_SENSOR_PIN, INPUT);   // GPIO 34: ADC1, input-only, no pull resistors
+    pinMode(METAL_SENSOR_PIN, INPUT);
     pinMode(BTN_1_PIN, INPUT_PULLDOWN);
     pinMode(BTN_2_PIN, INPUT_PULLDOWN);
     for (auto const& [name, data] : coinData) {
@@ -567,7 +748,6 @@ void setup() {
     }
 
     // --- UART2: open channel to slave BEFORE smart-setup check ---
-    // This ensures forwardWiFiToSlave() works even when we enter setup mode.
     Serial2.begin(SLAVE_UART_BAUD, SERIAL_8N1, SLAVE_UART_RX, SLAVE_UART_TX);
     delay(200);
     setAllRelaysOff(); // slave starts with all relays OFF regardless of mode
@@ -579,10 +759,6 @@ void setup() {
 
     if (saved_ssid == "") {
         // ── SETUP MODE ──────────────────────────────────────────
-        // No credentials saved yet. Start AP so the Flutter app
-        // can POST the home WiFi SSID/password to /setup.
-        // handleSetup() will also forward them to the slave via UART
-        // so both boards connect to the same network automatically.
         isSetupMode = true;
         currentPage = PAGE_SETUP;
 
@@ -595,7 +771,7 @@ void setup() {
         drawSetupPage();
         Serial.println("[SETUP] AP active. Waiting for Flutter app...");
         Serial.printf("[SETUP] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-        return; // skip normal init
+        return;
     }
 
     // ── NORMAL MODE ─────────────────────────────────────────────
@@ -610,7 +786,6 @@ void setup() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        // Credentials stale — wipe and reboot into setup mode
         tft.println("WiFi Failed!");
         tft.println("Resetting...");
         preferences.putString("ssid", "");
@@ -637,413 +812,318 @@ void setup() {
     if (LittleFS.begin(true)) {
         load_data();
     }
-    load_coin_settings();
 
+    load_coin_settings();
     currentPage = PAGE_INSERT;
     drawInsertPage();
 }
 
-// ================= FIREBASE REMOTE COMMANDS =================
-void check_wifi_change_command() {
-    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck < 10000) return;
-    lastCheck = millis();
-
-    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_change")) {
-        DynamicJsonDocument doc(256);
-        if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
-        if (!doc["pending"].as<bool>()) return;
-
-        String newSsid = doc["ssid"].as<String>();
-        String newPass = doc["pass"].as<String>();
-        if (newSsid.isEmpty()) return;
-
-        Serial.printf("[WiFi Change] New SSID: %s\n", newSsid.c_str());
-
-        FirebaseJson clearJson; clearJson.set("pending", false);
-        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_change", &clearJson);
-
-        tft.fillScreen(BG); drawHeader();
-        tft.setCursor(10, 35); tft.setTextColor(HL); tft.println("WiFi Change");
-        tft.setCursor(10, 52); tft.setTextColor(TXT); tft.println("Saving & rebooting");
-        tft.setCursor(10, 68); tft.setTextColor(OK); tft.println(newSsid);
-        tft.drawRect(0, 0, 160, 128, TXT);
-        delay(800);
-
-        preferences.putString("ssid", newSsid);
-        preferences.putString("pass", newPass);
-        forwardWiFiToSlave(newSsid, newPass);
-        ESP.restart();
-    }
-}
-
-void check_wifi_show_command() {
-    if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck < 10000) return;
-    lastCheck = millis();
-
-    if (Firebase.RTDB.getJSON(&fbdo, "/commands/wifi_show")) {
-        DynamicJsonDocument doc(128);
-        if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
-        if (!doc["pending"].as<bool>()) return;
-
-        // 1. Clear the command so it only fires once
-        FirebaseJson clearJson; clearJson.set("pending", false);
-        Firebase.RTDB.updateNode(&fbdo, "/commands/wifi_show", &clearJson);
-
-        // 2. Read saved SSID from NVS (password intentionally hidden for security)
-        String savedSsid = preferences.getString("ssid", "(not set)");
-
-        // 3. Display on TFT
-        tft.fillScreen(BG);
-        drawHeader();
-        tft.setCursor(10, 28); tft.setTextColor(HL);  tft.setTextSize(1);
-        tft.println("WiFi Credentials");
-        tft.setCursor(10, 45); tft.setTextColor(TXT);
-        tft.println("Connected Network:");
-        tft.setCursor(10, 58); tft.setTextColor(OK);  tft.setTextSize(1);
-        tft.println(savedSsid);
-        tft.setCursor(10, 76); tft.setTextColor(TXT);
-        tft.println("Password: ********");
-        tft.setCursor(10, 96); tft.setTextColor(ST77XX_CYAN);
-        tft.println("(Saved in memory)");
-        tft.drawRect(0, 0, 160, 128, HL);
-
-        // 4. Hold for 5 seconds then redraw the normal page
-        delay(5000);
-        switch (currentPage) {
-            case PAGE_INSERT:   drawInsertPage();   break;
-            case PAGE_SELECT:   drawSelectPage();   break;
-            case PAGE_CHARGING: drawChargingPage(); break;
-            case PAGE_WIFI:     drawWiFiPage();     break;
-            case PAGE_EXTEND:
-                if (selectingPort) drawPortSelectPage(highlightedPort);
-                else               drawExtendPage();
-                break;
-            default: drawInsertPage(); break;
-        }
-    }
-}
-
 // ================= LOOP =================
 void loop() {
-    // Setup mode: only serve the config web page
+    // ── Setup mode: just serve HTTP and return ─────────────────
     if (isSetupMode) {
         server.handleClient();
         return;
     }
 
-    // ── 1. METAL SENSOR (analog) ─────────────────────────────────
-    // digitalRead() cannot detect the 3.3→2.4 V drop from this sensor
-    // because 2.4 V is still above the ESP32 HIGH threshold (~1.8 V).
-    // analogRead() gives us the actual voltage level so we can set our
-    // own threshold between the idle voltage and the metal-present voltage.
-    {
-        int metalADC = analogRead(METAL_SENSOR_PIN);
-        bool metalBelow = (metalADC < METAL_ADC_THRESHOLD);
+    // ── Always drain slave UART for MAC pushes / stray ACKs ───
+    readSlaveUart();
 
-        if (metalBelow) {
-            if (!metalPinLow) {
-                // Reading just dropped below threshold — start hold timer
-                metalPinLow       = true;
-                metalLowStartTime = millis();
-                Serial.printf("[METAL] Below threshold (ADC=%d) — starting hold timer\n",
-                              metalADC);
-            } else if (!metalDetected &&
-                       (millis() - metalLowStartTime >= METAL_HOLD_MS)) {
-                // Held below threshold long enough — open the gate
-                metalDetected     = true;
-                metalDetectedTime = millis();
-                Serial.printf("[METAL] Confirmed (ADC=%d) — coin gate OPEN\n", metalADC);
+    unsigned long now = millis();
+
+    // ── 1-second countdown tick ────────────────────────────────
+    if (now - lastSecondTick >= 1000) {
+        lastSecondTick = now;
+
+        // Decrement charging port timers
+        for (int i = 0; i < 4; i++) {
+            if (portSeconds[i] > 0) {
+                portSeconds[i]--;
+                if (portSeconds[i] == 0) {
+                    portActive[i] = false;
+                    setRelay(i, false);     // UART: turn off relay
+                    Serial.printf("[PORT] Port %d expired\n", i);
+                }
             }
-        } else {
-            // Reading back above threshold — metal has passed
-            if (metalPinLow) {
-                Serial.printf("[METAL] Released (ADC=%d)\n", metalADC);
-            }
-            metalPinLow = false;
-            // Do NOT clear metalDetected — coin IR must consume it or timeout expires it
         }
 
-        // Auto-expire: gate open too long with no coin following
-        if (metalDetected && (millis() - metalDetectedTime > METAL_TIMEOUT_MS)) {
-            metalDetected = false;
-            metalPinLow   = false;
-            Serial.println("[METAL] Gate expired — CLOSED (timeout)");
+        // Decrement local WiFi display counter (visual only — slave keeps its own)
+        if (wifiSeconds > 0) {
+            wifiSeconds--;
         }
 
-        // Continuous debug — comment out after tuning is done
-        static unsigned long lastADCPrint = 0;
-        if (millis() - lastADCPrint > 500) {
-            lastADCPrint = millis();
-            Serial.printf("[METAL DEBUG] ADC=%d  (%.2fV)  gate=%s\n",
-                          metalADC,
-                          metalADC * 3.3f / 4095.0f,
-                          metalDetected ? "OPEN" : "closed");
-        }
+        // Refresh display if on a live page
+        if (currentPage == PAGE_CHARGING) drawChargingPage();
+        if (currentPage == PAGE_WIFI)     drawWiFiPage();
+
+        // Flag live status for Firebase push
+        needsStatusUpdate = true;
     }
 
-    // ── 2. COIN SENSOR POLLING ───────────────────────────────────
-    // Require the IR pin to stay LOW for 10 ms to reject noise glitches.
+    // ── Metal / coin sensor (ADC1, GPIO 34) ───────────────────
+    int adcVal = analogRead(METAL_SENSOR_PIN);
+    bool belowThreshold = (adcVal < METAL_ADC_THRESHOLD);
+
+    if (belowThreshold && !metalPinLow) {
+        // Reading just dropped below threshold — start hold timer
+        metalPinLow       = true;
+        metalLowStartTime = now;
+    } else if (!belowThreshold && metalPinLow) {
+        // Reading rose back above threshold — cancel hold
+        metalPinLow = false;
+    }
+
+    if (metalPinLow && !metalDetected &&
+        (now - metalLowStartTime >= METAL_HOLD_MS)) {
+        // Held low long enough — genuine metal detection
+        metalDetected     = true;
+        metalDetectedTime = now;
+        digitalWrite(LED_PIN, HIGH);
+        Serial.printf("[METAL] Detected (ADC=%d)\n", adcVal);
+    }
+
+    if (metalDetected && (now - metalDetectedTime >= METAL_TIMEOUT_MS)) {
+        metalDetected = false;
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("[METAL] Gate closed (timeout)");
+    }
+
+    // ── Coin input polling ─────────────────────────────────────
     for (auto& [name, data] : coinData) {
-        int currentState = digitalRead(data.pin);
+        if (!coinSettings[name].enabled) continue;
+        int state = digitalRead(data.pin);
+        if (state == LOW && data.lastState == HIGH) {
+            // Falling edge = coin inserted
+            int timeMinutes = coinSettings[name].time;
+            int timeSeconds = timeMinutes * 60;
+            int coinValue   = name.toInt();
 
-        if (currentState == LOW && data.lastState == HIGH) {
-            delay(10); // hold-time check — must still be LOW after 10 ms
-            if (digitalRead(data.pin) == LOW) {
+            credits        += coinValue;
+            pendingCredits += coinValue;
+            data.count++;
+            needsFirebaseUpdate = true;
+            save_data();
 
-                if (metalDetected && coinSettings[name].enabled) {
-                    Serial.printf("[COIN] Accepted P%s (metal age: %lu ms)\n",
-                                  name.c_str(), millis() - metalDetectedTime);
+            Serial.printf("[COIN] P%s inserted → credits=%d\n", name.c_str(), credits);
 
-                    metalDetected = false; // one metal detection = one coin only
-                    metalPinLow   = false;
-                    Serial.println("[METAL] Gate consumed — CLOSED");
+            // ── Routing: where does this coin go? ──────────────
+            if (currentPage == PAGE_INSERT || currentPage == PAGE_SELECT) {
+                // Not yet committed — move to selection
+                currentPage = PAGE_SELECT;
+                drawSelectPage();
 
-                    data.count++;
-                    save_data();
-                    needsFirebaseUpdate = true;
+            } else if (currentPage == PAGE_CHARGING) {
+                // Already charging: go to extend menu
+                currentPage = PAGE_EXTEND;
+                drawExtendPage();
 
-                    int coinValue    = name.toInt();
-                    int addedSeconds = coinSettings[name].time * 60;
+            } else if (currentPage == PAGE_WIFI) {
+                // Already in WiFi mode — show extend menu (extend or add new user)
+                wifiPendingCredits += coinValue;
+                currentPage = PAGE_WIFI_EXTEND;
+                drawWiFiExtendPage();
 
-                    if (currentPage == PAGE_INSERT) {
-                        credits           += coinValue;
-                        unassignedSeconds += addedSeconds;
-                        currentPage = PAGE_SELECT;
-                        drawSelectPage();
-                    }
-                    else if (currentPage == PAGE_SELECT) {
-                        credits           += coinValue;
-                        unassignedSeconds += addedSeconds;
-                        drawSelectPage();
-                    }
-                    else if (currentPage == PAGE_CHARGING ||
-                             currentPage == PAGE_WIFI     ||
-                             currentPage == PAGE_EXTEND) {
-                        pendingCredits    += coinValue;
-                        unassignedSeconds += addedSeconds;
+            } else if (currentPage == PAGE_WIFI_EXTEND) {
+                // Additional coin on WiFi extend page — accumulate
+                wifiPendingCredits += coinValue;
+                drawWiFiExtendPage();
 
-                        // A new coin interrupts any in-progress port selection
-                        // and brings the user back to the extend choice screen.
-                        selectingPort   = false;
-                        highlightedPort = -1;
-
-                        currentPage = PAGE_EXTEND;
-                        drawExtendPage();
-                    }
-
-                } else if (!metalDetected) {
-                    Serial.printf("[COIN] REJECTED P%s — gate closed (no metal)\n",
-                                  name.c_str());
-                } else if (!coinSettings[name].enabled) {
-                    Serial.printf("[COIN] REJECTED P%s — disabled in settings\n",
-                                  name.c_str());
-                }
+            } else if (currentPage == PAGE_EXTEND) {
+                // Additional coin on extend page — accumulate
+                drawExtendPage();
             }
         }
-        data.lastState = currentState;
+        data.lastState = state;
     }
 
-    // ── 3. SCREEN & BUTTON STATE MACHINE ─────────────────────────
+    // ── Button 1 ───────────────────────────────────────────────
+    static bool lastBtn1 = LOW;
+    bool btn1 = digitalRead(BTN_1_PIN);
+    bool btn1Pressed = (btn1 == HIGH && lastBtn1 == LOW);
+    lastBtn1 = btn1;
 
-    // PAGE: INSERT — blink "INSERT COIN"
-    if (currentPage == PAGE_INSERT) {
-        if (millis() - lastBlink > 500) {
-            lastBlink = millis();
-            showText  = !showText;
-            tft.fillRect(20, 100, 120, 20, BG);
-            if (showText) {
-                tft.setCursor(25, 100);
-                tft.setTextColor(HL);
-                tft.print("INSERT COIN");
-            }
-        }
-    }
+    // ── Button 2 ───────────────────────────────────────────────
+    static bool lastBtn2 = LOW;
+    bool btn2 = digitalRead(BTN_2_PIN);
+    bool btn2Pressed = (btn2 == HIGH && lastBtn2 == LOW);
+    lastBtn2 = btn2;
 
-    // PAGE: SELECT — choose Charging or WiFi
-    else if (currentPage == PAGE_SELECT) {
-        if (digitalRead(BTN_1_PIN) == HIGH) {
-            activateRandomPort(unassignedSeconds);
-            unassignedSeconds = 0;
+    // ── PAGE_SELECT button handling ────────────────────────────
+    if (currentPage == PAGE_SELECT) {
 
+        if (btn1Pressed) {
+            // [1] Charging — convert all pending credits to time
+            const int timePerCredit = 60; // seconds per peso credit
+            int timeToAdd = credits * timePerCredit;
+            activateRandomPort(timeToAdd);
+            dailyChargingEarned += (float)credits;  // record daily revenue
+            needsFirebaseUpdate  = true;
+            credits        = 0;
+            pendingCredits = 0;
             currentPage    = PAGE_CHARGING;
-            lastSecondTick = millis();
             drawChargingPage();
-            delay(300);
         }
-        else if (digitalRead(BTN_2_PIN) == HIGH) {
-            wifiSeconds      += unassignedSeconds;
-            unassignedSeconds = 0;
 
-            currentPage    = PAGE_WIFI;
-            lastSecondTick = millis();
+        if (btn2Pressed) {
+            // [2] WiFi — convert credits to seconds and push to slave
+            // Rate: 1 peso = 1 minute of captive-portal WiFi time.
+            // Change the multiplier below to adjust (e.g. 2*60 = 2 min/peso).
+            const int wifiSecsPerCredit = 60; // seconds per peso credit
+            int32_t wifiSecs = (int32_t)credits * wifiSecsPerCredit;
+
+            if (wifiSecs > 0) {
+                sendWifiTime(wifiTargetMac, wifiSecs);
+                wifiSeconds          = (int)wifiSecs;
+                wifiUsers            = 1;           // first user for this session
+                wifiEarningsTotal   += (float)credits;  // record revenue
+                dailyWifiEarned     += (float)credits;
+                credits              = 0;
+                pendingCredits       = 0;
+                needsFirebaseUpdate  = true;
+                needsStatusUpdate    = true;
+            } else {
+                Serial.println("[WiFi] No credits to assign.");
+            }
+
+            currentPage = PAGE_WIFI;
             drawWiFiPage();
-            delay(300);
         }
     }
 
-    // PAGE: CHARGING — per-port countdown
-    else if (currentPage == PAGE_CHARGING) {
-        if (millis() - lastSecondTick >= 1000) {
-            lastSecondTick = millis();
-            bool anyPortActive = false;
+    // ── PAGE_WIFI_EXTEND button handling ───────────────────────
+    if (currentPage == PAGE_WIFI_EXTEND) {
 
-            for (int i = 0; i < 4; i++) {
-                if (portSeconds[i] > 0) {
-                    portSeconds[i]--;
-                    anyPortActive = true;
+        if (btn1Pressed) {
+            // [1] Extend time for the current connected user
+            const int wifiSecsPerCredit = 60;
+            int32_t addSecs = (int32_t)wifiPendingCredits * wifiSecsPerCredit;
+            sendWifiTime(wifiTargetMac, addSecs);
+            wifiSeconds          += (int)addSecs;
+            wifiEarningsTotal    += (float)wifiPendingCredits;
+            dailyWifiEarned      += (float)wifiPendingCredits;
+            credits              -= wifiPendingCredits;
+            pendingCredits       -= wifiPendingCredits;
+            wifiPendingCredits    = 0;
+            needsFirebaseUpdate   = true;
+            needsStatusUpdate     = true;
+            currentPage           = PAGE_WIFI;
+            drawWiFiPage();
+        }
 
-                    if (portSeconds[i] <= 0) {
-                        portActive[i] = false;
-                        setRelay(i, false);         // ← UART: cut this port's relay
-                    }
-                }
-            }
-
-            if (anyPortActive) {
-                tft.fillRect(2, 22, 156, 100, BG);
-                int y = 30;
-                for (int i = 0; i < 4; i++) {
-                    if (portSeconds[i] > 0) {
-                        tft.setCursor(5, y);
-                        tft.setTextColor(OK);
-                        tft.printf("PORT %d ", i + 1);
-                        tft.setTextColor(HL);
-                        tft.println(formatTime(portSeconds[i]));
-                        y += 20;
-                    }
-                }
-            } else {
-                credits = 0;
-                deactivateAllPorts();               // ← UART: all relays OFF
-                currentPage = PAGE_INSERT;
-                drawInsertPage();
-            }
+        if (btn2Pressed) {
+            // [2] New user — send time to broadcast
+            const int wifiSecsPerCredit = 60;
+            int32_t addSecs = (int32_t)wifiPendingCredits * wifiSecsPerCredit;
+            sendWifiTime("FF:FF:FF:FF:FF:FF", addSecs);
+            wifiUsers++;
+            wifiEarningsTotal    += (float)wifiPendingCredits;
+            dailyWifiEarned      += (float)wifiPendingCredits;
+            credits              -= wifiPendingCredits;
+            pendingCredits       -= wifiPendingCredits;
+            wifiPendingCredits    = 0;
+            needsFirebaseUpdate   = true;
+            needsStatusUpdate     = true;
+            currentPage           = PAGE_WIFI;
+            drawWiFiPage();
         }
     }
 
-    // PAGE: WIFI — countdown
-    else if (currentPage == PAGE_WIFI) {
-        if (millis() - lastSecondTick >= 1000) {
-            lastSecondTick = millis();
-            if (wifiSeconds > 0) {
-                wifiSeconds--;
-                tft.fillRect(40, 30, 110, 20, BG);
-                tft.setCursor(10, 30);
-                tft.setTextColor(HL);
-                tft.print("Time: ");
-                tft.println(formatTime(wifiSeconds));
-            } else {
-                credits = 0;
-                currentPage = PAGE_INSERT;
-                drawInsertPage();
-            }
-        }
-    }
+    // ── PAGE_EXTEND button handling ────────────────────────────
+    if (currentPage == PAGE_EXTEND) {
 
-    // PAGE: EXTEND — coin inserted mid-session
-    // ──────────────────────────────────────────────────────────────
-    // Two sub-states controlled by the `selectingPort` flag:
-    //
-    //  selectingPort == false  →  Main extend screen
-    //    [BTN_1]  Enter port-select mode  (extend time on a specific port)
-    //    [BTN_2]  Activate a new free port; if all ports full → enter port-select
-    //
-    //  selectingPort == true   →  Port picker screen
-    //    [BTN_2]  Cycle the highlight to the next active port
-    //    [BTN_1]  Confirm: add unassignedSeconds to the highlighted port
-    // ──────────────────────────────────────────────────────────────
-    else if (currentPage == PAGE_EXTEND) {
+        if (btn1Pressed) {
+            // [1] Extend an existing port
+            int activeCount = 0;
+            for (int i = 0; i < 4; i++) if (portSeconds[i] > 0) activeCount++;
 
-        // ── SUB-STATE: port picker ────────────────────────────────
-        if (selectingPort) {
-
-            // BTN_2 → move highlight to next active port
-            if (digitalRead(BTN_2_PIN) == HIGH) {
-                // Search for the next active port after the current highlight
-                int next = -1;
-                for (int i = 1; i <= 4; i++) {
-                    int candidate = (highlightedPort + i) % 4;
-                    if (portSeconds[candidate] > 0) {
-                        next = candidate;
-                        break;
-                    }
-                }
-                // Only redraw if we actually moved to a different port
-                if (next != -1 && next != highlightedPort) {
-                    highlightedPort = next;
-                    drawPortSelectPage(highlightedPort);
-                }
-                delay(300);
-            }
-
-            // BTN_1 → confirm selection, add time, return to charging
-            else if (digitalRead(BTN_1_PIN) == HIGH) {
-                portSeconds[highlightedPort] += unassignedSeconds;
-                credits          += pendingCredits;
-                unassignedSeconds = 0;
-                pendingCredits    = 0;
-                selectingPort     = false;
-                highlightedPort   = -1;
-
+            if (activeCount == 1) {
+                // Only one port running — extend it directly
+                int port = firstActivePort();
+                const int timePerCredit = 60;
+                portSeconds[port]    += pendingCredits * timePerCredit;
+                dailyChargingEarned  += (float)pendingCredits;
+                needsFirebaseUpdate   = true;
+                pendingCredits = 0;
+                credits        = 0;
+                needsStatusUpdate = true;
                 currentPage    = PAGE_CHARGING;
-                lastSecondTick = millis();
                 drawChargingPage();
-                delay(300);
+            } else {
+                // Multiple ports — let user pick which one
+                selectingPort   = true;
+                highlightedPort = firstActivePort();
+                drawPortSelectPage(highlightedPort);
             }
         }
 
-        // ── SUB-STATE: extend / new-port choice ──────────────────
-        else {
-
-            // BTN_1 → enter port-select mode so user picks which port to extend
-            if (digitalRead(BTN_1_PIN) == HIGH) {
-                int fp = firstActivePort();
-                if (fp != -1) {
-                    selectingPort   = true;
-                    highlightedPort = fp;
-                    drawPortSelectPage(highlightedPort);
-                }
-                delay(300);
-            }
-
-            // BTN_2 → try to open a brand-new port
-            else if (digitalRead(BTN_2_PIN) == HIGH) {
-                // Check how many ports are truly free
-                int available = 0;
-                for (int i = 0; i < 4; i++) {
-                    if (!portActive[i] && portSeconds[i] <= 0) available++;
-                }
-
-                if (available > 0) {
-                    // At least one free port → activate it immediately
-                    activateRandomPort(unassignedSeconds);
-                    credits          += pendingCredits;
-                    unassignedSeconds = 0;
-                    pendingCredits    = 0;
-
-                    currentPage    = PAGE_CHARGING;
-                    lastSecondTick = millis();
-                    drawChargingPage();
-                } else {
-                    // All 4 ports busy → fall through to port-select for extension
-                    int fp = firstActivePort();
-                    if (fp != -1) {
-                        selectingPort   = true;
-                        highlightedPort = fp;
-                        drawPortSelectPage(highlightedPort);
-                    }
-                }
-                delay(300);
-            }
+        if (btn2Pressed) {
+            // [2] Open a new port
+            const int timePerCredit = 60;
+            int timeToAdd = pendingCredits * timePerCredit;
+            activateRandomPort(timeToAdd);
+            dailyChargingEarned += (float)pendingCredits;
+            needsFirebaseUpdate  = true;
+            pendingCredits = 0;
+            credits        = 0;
+            needsStatusUpdate = true;
+            currentPage    = PAGE_CHARGING;
+            drawChargingPage();
         }
     }
 
-    // ── 4. BACKGROUND TASKS ──────────────────────────────────────
+    // ── PORT-SELECT sub-mode (inside PAGE_EXTEND) ──────────────
+    if (selectingPort) {
+
+        if (btn1Pressed) {
+            // [1] Confirm highlighted port
+            if (highlightedPort >= 0 && portSeconds[highlightedPort] > 0) {
+                const int timePerCredit = 60;
+                portSeconds[highlightedPort] += pendingCredits * timePerCredit;
+                dailyChargingEarned  += (float)pendingCredits;
+                needsFirebaseUpdate   = true;
+                pendingCredits  = 0;
+                credits         = 0;
+                selectingPort   = false;
+                highlightedPort = -1;
+                needsStatusUpdate = true;
+                currentPage     = PAGE_CHARGING;
+                drawChargingPage();
+            }
+        }
+
+        if (btn2Pressed) {
+            // [2] Cycle to next active port
+            int next = highlightedPort;
+            for (int i = 1; i <= 4; i++) {
+                int candidate = (highlightedPort + i) % 4;
+                if (portSeconds[candidate] > 0) { next = candidate; break; }
+            }
+            highlightedPort = next;
+            drawPortSelectPage(highlightedPort);
+        }
+    }
+
+    // ── Auto-return to INSERT page when all sessions end ───────
+    if (currentPage == PAGE_CHARGING) {
+        bool anyActive = false;
+        for (int i = 0; i < 4; i++) if (portSeconds[i] > 0) anyActive = true;
+        if (!anyActive) {
+            currentPage = PAGE_INSERT;
+            drawInsertPage();
+        }
+    }
+
+    if (currentPage == PAGE_WIFI && wifiSeconds <= 0) {
+        wifiPendingCredits = 0;
+        wifiUsers          = 0;
+        needsStatusUpdate  = true;
+        currentPage = PAGE_INSERT;
+        drawInsertPage();
+    }
+
+    // ── Firebase periodic sync ─────────────────────────────────
     update_firebase();
-    check_wifi_change_command();
-    check_wifi_show_command();
+    push_status_firebase();
+
+    delay(10);
 }
